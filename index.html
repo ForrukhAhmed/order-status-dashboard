@@ -4,6 +4,7 @@
 <title>Order Status Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 :root{--bg:#f3f5f9;--card:#fff;--tx:#1b2433;--mut:#6b7587;--bd:#dde2ea;--ac:#1f3a68;--ok:#1a8f5a;--bad:#d1453b;--warn:#c98a10;--hi:#fff8d6;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f141d;--card:#18202d;--tx:#e6ebf3;--mut:#93a0b5;--bd:#2a3546;--ac:#6f9cf0;--ok:#3fc58a;--bad:#ff7a70;--warn:#e6b04a;--hi:#3a3416;color-scheme:dark}}
@@ -40,6 +41,8 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}tr.tot td{font-weig
 .login h2{margin:0 0 8px}.login label{margin:12px 0}.login input{width:100%;padding:10px}.login .b{background:var(--ac);color:white;border:0;padding:10px 18px;border-radius:7px;cursor:pointer}
 body.viewer nav button[data-tab="form"],body.viewer nav button[data-tab="set"]{display:none}
 body.viewer .admin-only{display:none!important}
+#authbar #savestat{margin-right:auto;opacity:.9}
+.c .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 </style></head><body>
 <header><h1>ORDER STATUS DASHBOARD</h1><p>Orders, shipments, yarn booking and yarn purchase &mdash; one place</p>
 <div id="authbar"></div><nav id="nav"></nav></header>
@@ -52,19 +55,62 @@ const $=s=>document.querySelector(s);
 const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nf=(v,d=0)=>(+v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const today=()=>new Date().toISOString().slice(0,10);
-let S={added:[],ov:{},pur:[],set:{eur:1.1,yld:0.88,thr:1,asof:'',yarns:['20/s Cotton','24/s Cotton','26/s Cotton','28/s Cotton','30/s Cotton','34/s Cotton','10/s CVC','16/s CVC','75D','20/s Cotton Slub','20/s long Cotton Slub'],depts:['MAIN','NOOS','JUNIOR','LIC']}};
-let DB=null,saveT,tab='dash',CH={},currentUser=null,isAdmin=false,remoteReady=false,remoteBusy=false,lastUpdated=null;
+const DEFSET={eur:1.1,yld:0.88,thr:1,asof:'',yarns:['20/s Cotton','24/s Cotton','26/s Cotton','28/s Cotton','30/s Cotton','34/s Cotton','10/s CVC','16/s CVC','75D','20/s Cotton Slub','20/s long Cotton Slub'],depts:['MAIN','NOOS','JUNIOR','LIC']};
+let S={orders:[],pur:[],set:JSON.parse(JSON.stringify(DEFSET))};
+let DB=null,saveT,tab='dash',CH={},currentUser=null,isAdmin=false,remoteReady=false,saving=false,lastHash='',IMSG='';
+const PEND=new Set();
+/* ====== Google Sheet storage: paste your Apps Script Web App URL here ====== */
+const GS_URL='https://script.google.com/macros/s/AKfycbxvZRPlUfhwD33-M_QB3UjaNdvQk-Iq8041VFlIE5Z9AjLE3Xr_1SZONwj9tW1aoTb0/exec';
 const SUPABASE_URL='https://xokevhfijwrfvhwblwqj.supabase.co';
 const SUPABASE_ANON_KEY='sb_publishable_tH1Wn394WuyVY9zaYefe7Q_CLQQsirU';
 const ADMIN_UID='dd086426-c4d0-408e-9e08-a8138b57cf0f';
 const F={yr:'2026',dept:'All',mo:'All'},YB={yr:'2026',dept:'All'},YP={from:'',to:'',y:'All',basis:'act'},DE={q:'',pg:0},EF={id:null};
-function adopt(j){try{const d=typeof j==='string'?JSON.parse(j):j;if(d&&typeof d==='object'){S=Object.assign({},S,d);S.set=Object.assign({},S.set,d.set||{})}}catch(e){}}
+const YN=[1,2,3,4,5,6];
+const FIELDS=['id','style','desc','dept','po','pack','pcs','opd','ship','act','cur','fob','cons',...YN.flatMap(n=>['y'+n,'p'+n])];
+const NUMF=['pack','pcs','fob','cons'];
+const p2=n=>String(n).padStart(2,'0');
+/* date parser: returns '' for blank, null for unreadable, else yyyy-mm-dd */
+function pd(v){if(v===''||v==null)return '';
+ if(v instanceof Date)return isNaN(v)?null:v.toISOString().slice(0,10);
+ if(typeof v==='number'){return(v>20000&&v<80000)?new Date(Math.round((v-25569)*864e5)).toISOString().slice(0,10):null}
+ const s=String(v).trim();if(!s)return '';let m;
+ if(m=s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))return m[1]+'-'+p2(m[2])+'-'+p2(m[3]);
+ if(m=s.match(/^(\d{1,2})[-\/. ](\d{1,2})[-\/. ](\d{2,4})$/)){let y=m[3];if(y.length===2)y='20'+y;return y+'-'+p2(m[2])+'-'+p2(m[1])}
+ if(m=s.match(/^(\d{1,2})[-\/. ]([A-Za-z]{3})[A-Za-z]*[-\/. ,]*(\d{2,4})$/)){const mi=MON.findIndex(x=>x.toLowerCase()===m[2].toLowerCase());if(mi>=0){let y=m[3];if(y.length===2)y='20'+y;return y+'-'+p2(mi+1)+'-'+p2(m[1])}}
+ if(/^\d{5}$/.test(s))return pd(+s);
+ return null}
+const num=v=>{if(v===''||v==null)return '';if(typeof v==='number')return v;const s=String(v).replace(/,/g,'').trim();return s===''?'':+s};
+function toRow(o){const r={};FIELDS.forEach(k=>{let v=o[k];if(v==null)v='';if(/^p\d$/.test(k)){v=(v===''||!o['y'+k[1]])?'':+(+v*100).toFixed(4)}r[k]=v});return r}
+function fromRow(r){const o={};FIELDS.forEach(k=>{let v=r[k];if(v==null)v='';if(NUMF.includes(k))v=v===''?'':(+v||0);else if(/^p\d$/.test(k))v=v===''?'':+((+v||0)/100).toFixed(6);else if(k==='opd'||k==='ship'||k==='act')v=pd(v)||'';else v=String(v).trim();o[k]=v});return o}
+const toP=p=>({id:p.id||'',d:p.d||'',y:p.y||'',sup:p.sup||'',ref:p.ref||'',qty:+p.qty||0});
+const fromP=r=>({id:String(r.id||'').trim(),d:pd(r.d)||'',y:String(r.y==null?'':r.y).trim(),sup:String(r.sup==null?'':r.sup).trim(),ref:String(r.ref==null?'':r.ref).trim(),qty:+r.qty||0});
+const toSet=s=>({eur:String(s.eur),yld:String(s.yld),thr:String(s.thr),asof:s.asof||'',yarns:s.yarns.join(' | '),depts:s.depts.join(' | ')});
+function parseSet(r){const d=DEFSET,o={},has=k=>r[k]!==undefined&&r[k]!=='';const l=s=>String(s||'').split('|').map(x=>x.trim()).filter(Boolean);
+ o.eur=has('eur')?(+r.eur||d.eur):d.eur;o.yld=has('yld')?(+r.yld||d.yld):d.yld;o.thr=has('thr')?(+r.thr):d.thr;o.asof=pd(r.asof)||'';
+ o.yarns=l(r.yarns).length?l(r.yarns):d.yarns.slice();o.depts=l(r.depts).length?l(r.depts):d.depts.slice();return o}
+const hashOf=r=>JSON.stringify([r.orders,r.pur,r.set]);
+function setStat(t){const e=$('#savestat');if(e)e.textContent=t}
+async function gs(action,extra={}){
+ if(!GS_URL||GS_URL.indexOf('PASTE')===0)throw new Error('Google Apps Script URL set kora hoyni (index.html-er GS_URL).');
+ const{data}=await DB.auth.getSession();if(!data.session)throw new Error('Sign in kora nei');
+ const r=await fetch(GS_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(Object.assign({action,token:data.session.access_token},extra))});
+ const t=await r.text();try{return JSON.parse(t)}catch(e){throw new Error('Apps Script theke thik response ashe nai. Deploy "Anyone" access diye hoyeche kina dekhun.')}}
+function applyLoad(r){const used=new Set(),fix=(o,i,pre)=>{if(!o.id||used.has(o.id))o.id=pre+Date.now().toString(36)+i;used.add(o.id);return o};
+ S.orders=(r.orders||[]).map(fromRow).map((o,i)=>fix(o,i,'m'));S.pur=(r.pur||[]).map(fromP).map((p,i)=>fix(p,i,'q'));S.set=parseSet(r.set||{});lastHash=hashOf(r)}
 function loginView(msg=''){document.body.classList.remove('viewer');$('#nav').innerHTML='';$('#authbar').innerHTML='';$('#main').innerHTML=`<div class="login"><h2>Dashboard Login</h2><p class="note">Sign in with your assigned account to access the shared dashboard.</p><form onsubmit="signIn(event)"><label>Email<input id="loginEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button class="b" type="submit">Sign in</button></form><p class="msg neg" id="loginMsg">${esc(msg)}</p></div>`}
 async function signIn(e){e.preventDefault();const m=$('#loginMsg');m.textContent='Signing in...';const{error}=await DB.auth.signInWithPassword({email:$('#loginEmail').value.trim(),password:$('#loginPassword').value});if(error)m.textContent=error.message}
 async function signOut(){await DB.auth.signOut();currentUser=null;isAdmin=false;remoteReady=false;loginView('You have signed out.')}
-function authBar(){const role=isAdmin?'Admin':'Viewer';$('#authbar').innerHTML=`<span>${esc(currentUser.email||'')} · ${role}</span><button onclick="signOut()">Sign out</button>`}
-function save(){if(!isAdmin||!remoteReady)return;clearTimeout(saveT);saveT=setTimeout(async()=>{try{try{localStorage.setItem('osd',JSON.stringify(S))}catch(e){}remoteBusy=true;const{data,error}=await DB.from('dashboard_state').upsert({id:'main',data:S,updated_at:new Date().toISOString()},{onConflict:'id'}).select('updated_at').single();remoteBusy=false;if(error)alert('Save failed: '+error.message);else lastUpdated=data.updated_at}catch(e){remoteBusy=false;alert('Save failed: '+e.message)}},450)}
-async function loadSharedData(){const{data,error}=await DB.from('dashboard_state').select('data,updated_at').eq('id','main').maybeSingle();if(error)throw error;if(data&&data.data){adopt(data.data);lastUpdated=data.updated_at}else if(isAdmin){let local='{}';try{local=localStorage.getItem('osd')||'{}'}catch(e){}adopt(local);const{data:created,error:writeError}=await DB.from('dashboard_state').upsert({id:'main',data:S,updated_at:new Date().toISOString()},{onConflict:'id'}).select('updated_at').single();if(writeError)throw writeError;lastUpdated=created.updated_at}else{adopt({added:[],ov:{},pur:[]})}remoteReady=true;show(tab)}
+function authBar(){const role=isAdmin?'Admin':'Viewer';$('#authbar').innerHTML=`<span id="savestat"></span><span>${esc(currentUser.email||'')} · ${role}</span><button onclick="signOut()">Sign out</button>`}
+function save(...w){if(!isAdmin||!remoteReady)return;w.forEach(x=>PEND.add(x));setStat('Saving to Google Sheet...');clearTimeout(saveT);saveT=setTimeout(flush,500)}
+async function flush(){if(saving){saveT=setTimeout(flush,400);return}const w=[...PEND];PEND.clear();if(!w.length)return;saving=true;
+ try{const b={};if(w.includes('orders'))b.orders=S.orders.map(toRow);if(w.includes('pur'))b.pur=S.pur.map(toP);if(w.includes('set'))b.set=toSet(S.set);
+  const r=await gs('save',b);if(!r.ok)throw new Error(r.error);lastHash=null;setStat('Saved to Google Sheet '+new Date().toLocaleTimeString())}
+ catch(e){w.forEach(x=>PEND.add(x));setStat('SAVE FAILED');alert('Google Sheet-e save hoyni: '+e.message)}finally{saving=false}}
+async function loadSharedData(){const r=await gs('load');if(!r.ok)throw new Error(r.error);applyLoad(r);remoteReady=true;setStat('Google Sheet connected');show(tab)}
+async function reloadSheet(){try{await loadSharedData()}catch(e){alert(e.message)}}
+async function pollSheet(){if(!currentUser||!remoteReady||saving||PEND.size||document.hidden||tab==='form'||tab==='set')return;
+ try{const r=await gs('load');if(!r.ok)return;const h=hashOf(r);if(lastHash===null){lastHash=h;return}if(h!==lastHash){applyLoad(r);show(tab)}}catch(e){}}
+window.addEventListener('beforeunload',e=>{if(PEND.size||saving){e.preventDefault();e.returnValue=''}});
 async function startApp(session){currentUser=session.user;isAdmin=currentUser.id===ADMIN_UID;document.body.classList.toggle('viewer',!isAdmin);authBar();try{await loadSharedData()}catch(e){$('#main').innerHTML=`<div class="login"><h2>Unable to load dashboard</h2><p class="neg">${esc(e.message)}</p><button class="b" onclick="signOut()">Sign out</button></div>`}}
 
 const asof=()=>S.set.asof||today();
@@ -74,8 +120,8 @@ e.yr=o.ship?+o.ship.slice(0,4):0;e.mo=o.ship?+o.ship.slice(5,7)-1:-1;
 e.days=o.act&&o.ship?Math.round((new Date(o.ship)-new Date(o.act))/864e5):null;
 e.st=!o.act?'Pending':(e.days<+S.set.thr?'Late':'On Time');
 e.req=o.cons?(+o.cons/12*e.tp)/+S.set.yld:0;
-e.yk=[1,2,3,4].map(n=>o['y'+n]?e.req*(+o['p'+n]||0):0);return e}
-function orders(){const L=[];BASE.forEach((a,i)=>{const id='b'+i;if(S.ov[id]===null)return;L.push(S.ov[id]||Object.assign({id},zip(a)))});S.added.forEach(o=>L.push(o));return L.map(enr)}
+e.yk=YN.map(n=>o['y'+n]?e.req*(+o['p'+n]||0):0);return e}
+function orders(){return S.orders.map(enr)}
 function mk(id,cfg){if(CH[id])CH[id].destroy();const el=document.getElementById(id);if(!el||!window.Chart)return;const t=getComputedStyle(document.documentElement).getPropertyValue('--mut');Chart.defaults.color=t;CH[id]=new Chart(el,cfg)}
 function sel(id,opts,val,fn){return `<select id="${id}" onchange="${fn}">${opts.map(o=>`<option${String(o)===String(val)?' selected':''}>${esc(o)}</option>`).join('')}</select>`}
 const yrs=()=>['All',...[...new Set(orders().map(o=>o.yr).filter(Boolean))].sort()];
@@ -83,7 +129,7 @@ const tag=s=>`<span class="tag ${s.replace(' ','')}">${s}</span>`;
 function tbl(h,rows,nc=[]){return `<div class="w"><table><tr>${h.map((x,i)=>`<th class="${nc.includes(i)?'n':''}">${x}</th>`).join('')}</tr>${rows.join('')}</table></div>`}
 
 const TABS=[['dash','Dashboard'],['data','Data Entry'],['form','Entry Form'],['po','PO Lookup'],['yb','Yarn Booking'],['yp','Yarn Purchase'],['set','Settings']];
-function show(t){if(!isAdmin&&(t==='form'||t==='set'))t='dash';tab=t;$('#nav').innerHTML=TABS.filter(([i])=>isAdmin||!['form','set'].includes(i)).map(([i,l])=>`<button data-tab="${i}" class="${i===t?'on':''}${i==='yp'?' new':''}" onclick="show('${i}')">${l}</button>`).join('');V[t]()}
+function show(t){if(!isAdmin&&(t==='form'||t==='set'))t='dash';tab=t;$('#nav').innerHTML=TABS.filter(([i])=>isAdmin||!['form','set'].includes(i)).map(([i,l])=>`<button data-tab="${i}" class="${i===t?'on':''}${i==='yp'?' new':''}" onclick="show('${i}')">${l}</button>`).join('');IMSG='';V[t]();banner()}
 
 /* ---------- Dashboard ---------- */
 function setF(k,v){F[k]=v;V.dash()}
@@ -106,7 +152,7 @@ mk('c1',{type:'bar',data:{labels:MON,datasets:[['On Time','#1a8f5a'],['Late','#d
 mk('c2',{type:'doughnut',data:{labels:['On Time','Late','Pending'],datasets:[{data:['On Time','Late','Pending'].map(s=>L.filter(o=>o.st===s).length),backgroundColor:['#1a8f5a','#d1453b','#c98a10']}]}});
 const D=all.filter(o=>f(o,1,0)),dp=S.set.depts;
 mk('c3',{type:'bar',data:{labels:dp,datasets:[{label:'Orders',data:dp.map(d=>D.filter(o=>o.dept===d).length),backgroundColor:'#4a7bd0'}]},options:{plugins:{legend:{display:false}}}});
-const ys=S.set.yarns,yk=ys.map(y=>L.reduce((s,o)=>s+[1,2,3,4].reduce((t,n)=>t+(o['y'+n]===y?o.yk[n-1]:0),0),0));
+const ys=S.set.yarns,yk=ys.map(y=>L.reduce((s,o)=>s+YN.reduce((t,n)=>t+(o['y'+n]===y?o.yk[n-1]:0),0),0));
 mk('c4',{type:'bar',data:{labels:ys,datasets:[{label:'kg',data:yk.map(v=>Math.round(v)),backgroundColor:'#8a6fd1'}]},options:{indexAxis:'y',plugins:{legend:{display:false}}}});
 const rows=dp.map(d=>{const x=D.filter(o=>o.dept===d),s=x.filter(o=>o.act);return `<tr><td>${esc(d)}</td><td class="n">${nf(x.length)}</td><td class="n">${nf(sum(x,'tp'))}</td><td class="n">${nf(sum(x,'usd'))}</td><td class="n">${s.length?Math.round(s.filter(o=>o.st==='On Time').length/s.length*100)+'%':'-'}</td></tr>`});
 const s2=D.filter(o=>o.act);rows.push(`<tr class="tot"><td>Total (all depts)</td><td class="n">${nf(D.length)}</td><td class="n">${nf(sum(D,'tp'))}</td><td class="n">${nf(sum(D,'usd'))}</td><td class="n">${s2.length?Math.round(s2.filter(o=>o.st==='On Time').length/s2.length*100)+'%':'-'}</td></tr>`);
@@ -115,49 +161,53 @@ $('#dt').innerHTML=tbl(['Dept','Orders','Total pcs','Value (USD eq.)','On-time %
 /* ---------- Data Entry ---------- */
 V.data=()=>{const all=orders(),cnt={};all.forEach(o=>cnt[o.po]=(cnt[o.po]||0)+1);const dups=Object.values(cnt).filter(c=>c>1).length;
 const q=DE.q.toLowerCase(),L=all.filter(o=>!q||[o.po,o.style,o.desc,o.dept].join(' ').toLowerCase().includes(q)),P=100,pgs=Math.max(1,Math.ceil(L.length/P));DE.pg=Math.min(DE.pg,pgs-1);
-const rows=L.slice(DE.pg*P,DE.pg*P+P).map(o=>`<tr class="${cnt[o.po]>1?'dup':''}"><td>${esc(o.style)}</td><td>${esc(o.desc)}</td><td>${esc(o.dept)}</td><td>${esc(o.po)}</td><td class="n">${nf(o.pack)}</td><td class="n">${nf(o.tp)}</td><td>${o.ship}</td><td>${o.act||''}</td><td>${o.cur}</td><td class="n">${nf(o.val,2)}</td><td>${tag(o.st)}</td><td class="n">${o.req?nf(o.req):''}</td><td>${isAdmin?`<button class="g" onclick="editO('${o.id}')">Edit</button> <button class="g" id="x${o.id}" onclick="delO('${o.id}')">Delete</button>`:''}</td></tr>`);
-$('#main').innerHTML=`<div class="bar"><label>Search PO / style / dept<input id="dq" value="${esc(DE.q)}" oninput="DE.q=this.value;DE.pg=0;V.data();$('#dq').focus();$('#dq').setSelectionRange(99,99)"></label>${isAdmin?`<button class="b" onclick="EF.id=null;show('form')">+ New order</button>`:''}<span class="note">Records ${nf(all.length)} &nbsp;|&nbsp; Duplicate POs ${dups} (red rows)</span></div>
-${tbl(['Style','Description','Dept','PO','Pack qty','Total pcs','Ship date','Actual ship','Cur','Value','Status','Yarn kg',''],rows,[4,5,9,11])}
+const rows=L.slice(DE.pg*P,DE.pg*P+P).map(o=>`<tr class="${cnt[o.po]>1?'dup':''}"><td>${esc(o.style)}</td><td>${esc(o.desc)}</td><td>${esc(o.dept)}</td><td>${esc(o.po)}</td><td>${o.opd||''}</td><td class="n">${nf(o.pack)}</td><td class="n">${nf(o.tp)}</td><td>${o.ship}</td><td>${o.act||''}</td><td>${o.cur}</td><td class="n">${nf(o.val,2)}</td><td>${tag(o.st)}</td><td class="n">${o.req?nf(o.req):''}</td><td>${isAdmin?`<button class="g" onclick="editO('${o.id}')">Edit</button> <button class="g" id="x${o.id}" onclick="delO('${o.id}')">Delete</button>`:''}</td></tr>`);
+$('#main').innerHTML=`${msgBox()}<div class="bar"><label>Search PO / style / dept<input id="dq" value="${esc(DE.q)}" oninput="DE.q=this.value;DE.pg=0;V.data();$('#dq').focus();$('#dq').setSelectionRange(99,99)"></label>${isAdmin?`<button class="b" onclick="EF.id=null;show('form')">+ New order</button> <button class="g" onclick="$('#xo').click()">&#8679; Upload Excel</button><input id="xo" type="file" accept=".xlsx,.xls,.csv" hidden onchange="impOrders(this)"> <button class="g" onclick="tplOrders()">Excel template</button>`:''}<span class="note">Records ${nf(all.length)} &nbsp;|&nbsp; Duplicate POs ${dups} (red rows)</span></div>
+${tbl(['Style','Description','Dept','PO','Order placed','Pack qty','Total pcs','Ship date','Actual ship','Cur','Value','Status','Yarn kg',''],rows,[5,6,10,12])}
 <p class="note">Showing ${nf(L.length?DE.pg*P+1:0)}&ndash;${nf(Math.min(L.length,DE.pg*P+P))} of ${nf(L.length)} &nbsp; <button class="g" onclick="DE.pg=Math.max(0,DE.pg-1);V.data()">Prev</button> <button class="g" onclick="DE.pg=Math.min(${pgs-1},DE.pg+1);V.data()">Next</button></p>`};
 function editO(id){EF.id=id;show('form')}
-function delO(id){const b=$('#x'+id);if(b.dataset.a!=='1'){b.dataset.a='1';b.textContent='Sure?';return}if(id[0]==='b')S.ov[id]=null;else S.added=S.added.filter(o=>o.id!==id);save();V.data()}
+function delO(id){const b=$('#x'+id);if(b.dataset.a!=='1'){b.dataset.a='1';b.textContent='Sure?';return}S.orders=S.orders.filter(o=>o.id!==id);save('orders');V.data()}
 
 /* ---------- Entry Form ---------- */
-V.form=()=>{const o=EF.id?orders().find(x=>x.id===EF.id):null,v=k=>o&&o[k]!=null?esc(o[k]):'',ys=['',...S.set.yarns];
+V.form=()=>{const o=EF.id?orders().find(x=>x.id===EF.id):null,v=k=>o&&o[k]!=null?esc(o[k]):'',ys=['',...new Set([...S.set.yarns,...(o?YN.map(n=>o['y'+n]).filter(Boolean):[])])];
 const inp=(k,l,t='text',x='')=>`<label>${l}<input id="f_${k}" type="${t}" value="${v(k)}" ${x}></label>`;
-$('#main').innerHTML=`<div class="c"><h3>${o?'Edit order':'New order entry form'}</h3><div class="form">${inp('style','Style name')}${inp('desc','Description')}<label>Dept${sel('f_dept',S.set.depts,o?o.dept:S.set.depts[0],'')}</label>${inp('po','PO')}${inp('pack','Pack qty','number')}${inp('pcs','Pcs / pack','number')}${inp('ship','Ship date','date')}${inp('act','Actual ship date','date')}<label>Currency${sel('f_cur',['USD','EUR'],o?o.cur:'USD','')}</label>${inp('fob','FOB (per pack)','number','step="any"')}${inp('cons','Consumption (kg/dz)','number','step="any"')}</div>
-<h3 style="margin-top:14px">Yarn composition (up to 4 counts, total 100%)</h3><div class="form">${[1,2,3,4].map(n=>`<label>Yarn count ${n}${sel('f_y'+n,ys,o?o['y'+n]||'':'','calcP()')}</label><label>Share %<input id="f_p${n}" type="number" step="any" value="${o&&o['p'+n]?+(o['p'+n]*100).toFixed(2):''}" oninput="calcP()"></label>`).join('')}</div>
+$('#main').innerHTML=`<div class="c"><h3>${o?'Edit order':'New order entry form'}</h3><div class="form">${inp('style','Style no.','text','list="dl_style" onchange="autoStyle()"')}${inp('desc','Description')}<label>Dept${sel('f_dept',S.set.depts,o?o.dept:S.set.depts[0],'')}</label>${inp('po','PO')}${inp('pack','Pack qty','number','oninput="calcP()"')}${inp('pcs','Pcs / pack','number','oninput="calcP()"')}${inp('opd','Order placement date','date')}${inp('ship','Ship date','date')}${inp('act','Actual ship date','date')}<label>Currency${sel('f_cur',['USD','EUR'],o?o.cur:'USD','')}</label>${inp('fob','FOB (per pack)','number','step="any"')}${inp('cons','Consumption (kg/dz)','number','step="any" oninput="calcP()"')}</div>
+<datalist id="dl_style">${[...new Set(S.orders.map(x=>x.style).filter(Boolean))].map(s=>`<option value="${esc(s)}">`).join('')}</datalist><p class="note" id="stmsg" style="margin:6px 0 0"></p>
+<h3 style="margin-top:14px">Yarn composition (up to 6 counts, total 100%)</h3><div class="form">${YN.map(n=>`<label>Yarn count ${n}${sel('f_y'+n,ys,o?o['y'+n]||'':'','calcP()')}</label><label>Share %<input id="f_p${n}" type="number" step="any" value="${o&&o['p'+n]?+(o['p'+n]*100).toFixed(2):''}" oninput="calcP()"></label>`).join('')}</div>
 <p class="msg" id="fmsg"></p><button class="b" onclick="subO()">${o?'Save changes':'Submit'}</button> <button class="g" onclick="EF.id=null;V.form()">Clear</button> <button class="g" onclick="show('data')">Back to Data Entry</button></div>`;calcP()};
-function calcP(){const t=[1,2,3,4].reduce((s,n)=>s+(+$('#f_p'+n).value||0),0),c=$('#f_cons').value;$('#fmsg').innerHTML=(t||c)?`Total % : <b>${+t.toFixed(2)}</b> ${Math.abs(t-100)<.01?'<span class="pos">OK</span>':'<span class="neg">must be 100%</span>'}`:''}
-function subO(){const g=k=>$('#f_'+k).value.trim(),o={};['style','desc','dept','po','cur','ship','act'].forEach(k=>o[k]=g(k));['pack','pcs','fob','cons'].forEach(k=>o[k]=g(k)===''?'':+g(k));
-[1,2,3,4].forEach(n=>{o['y'+n]=g('y'+n);o['p'+n]=o['y'+n]?(+g('p'+n)||0)/100:''});
+function calcP(){const t=YN.reduce((s,n)=>s+(+$('#f_p'+n).value||0),0),c=+$('#f_cons').value||0,tp=(+$('#f_pack').value||0)*(+$('#f_pcs').value||0),req=c&&tp?(c/12*tp)/(+S.set.yld||.88):0;
+let h=(t||c)?`Total % : <b>${+t.toFixed(2)}</b> ${Math.abs(t-100)<.01?'<span class="pos">OK</span>':'<span class="neg">must be 100%</span>'}`:'';
+if(req){h+=`<br>Total yarn required: <b>${nf(req,1)} kg</b>`+YN.filter(n=>$('#f_y'+n).value&&+$('#f_p'+n).value).map(n=>` &nbsp;|&nbsp; ${esc($('#f_y'+n).value)}: ${nf(req*(+$('#f_p'+n).value)/100,1)} kg`).join('')}
+$('#fmsg').innerHTML=h}
+function subO(){const g=k=>$('#f_'+k).value.trim(),o={};['style','desc','dept','po','cur','opd','ship','act'].forEach(k=>o[k]=g(k));['pack','pcs','fob','cons'].forEach(k=>o[k]=g(k)===''?'':+g(k));
+YN.forEach(n=>{o['y'+n]=g('y'+n);o['p'+n]=o['y'+n]?(+g('p'+n)||0)/100:''});
 const m=$('#fmsg');if(!o.po){m.innerHTML='<span class="neg">PO is required</span>';return}
 if(orders().some(x=>x.po===o.po&&x.id!==EF.id)){m.innerHTML='<span class="neg">This PO already exists</span>';return}
 if(!o.ship){m.innerHTML='<span class="neg">Ship date is required</span>';return}
-const t=[1,2,3,4].reduce((s,n)=>s+(o['p'+n]||0),0);if(o.cons&&Math.abs(t-1)>1e-4){m.innerHTML='<span class="neg">Yarn shares must total 100%</span>';return}
-if(EF.id){o.id=EF.id;if(EF.id[0]==='b')S.ov[EF.id]=o;else S.added=S.added.map(x=>x.id===EF.id?o:x)}else{o.id='n'+Date.now();S.added.push(o)}
-save();EF.id=null;show('data')}
+const t=YN.reduce((s,n)=>s+(o['p'+n]||0),0);if(o.cons&&Math.abs(t-1)>1e-4){m.innerHTML='<span class="neg">Yarn shares must total 100%</span>';return}
+if(EF.id){o.id=EF.id;S.orders=S.orders.map(x=>x.id===EF.id?o:x)}else{o.id='n'+Date.now();S.orders.push(o)}
+save('orders');EF.id=null;show('data')}
 
 /* ---------- PO Lookup ---------- */
 let POQ='';
 V.po=()=>{$('#main').innerHTML=`<div class="bar"><label>Enter PO number<input id="pq" value="${esc(POQ)}" oninput="POQ=this.value;poRes()" style="min-width:260px"></label></div><div id="pr"></div>`;poRes()};
 function poRes(){const q=POQ.trim().toLowerCase(),o=q&&orders().find(x=>String(x.po).toLowerCase()===q),r=$('#pr');if(!q){r.innerHTML='<p class="note">Type or paste a PO number</p>';return}if(!o){r.innerHTML='<p class="neg">PO not found</p>';return}
 const kv=(a)=>a.map(([k,v])=>`<tr><td class="note">${k}</td><td>${v}</td></tr>`).join('');
-const yy=[1,2,3,4].filter(n=>o['y'+n]).map(n=>`${esc(o['y'+n])} ${+(o['p'+n]*100).toFixed(1)}% = ${nf(o.yk[n-1],1)} kg`).join('<br>')||'-';
-r.innerHTML=`<div class="grid"><div class="c"><h3>Order</h3><table>${kv([['Style',esc(o.style)],['Description',esc(o.desc)],['Dept',esc(o.dept)],['PO',esc(o.po)],['Pack qty',nf(o.pack)],['Pcs / pack',o.pcs],['Total pcs',nf(o.tp)]])}</table></div>
+const yy=YN.filter(n=>o['y'+n]).map(n=>`${esc(o['y'+n])} ${+(o['p'+n]*100).toFixed(1)}% = ${nf(o.yk[n-1],1)} kg`).join('<br>')||'-';
+r.innerHTML=`<div class="grid"><div class="c"><h3>Order</h3><table>${kv([['Style',esc(o.style)],['Description',esc(o.desc)],['Dept',esc(o.dept)],['PO',esc(o.po)],['Order placed',o.opd||'-'],['Pack qty',nf(o.pack)],['Pcs / pack',o.pcs],['Total pcs',nf(o.tp)]])}</table></div>
 <div class="c"><h3>Shipment</h3><table>${kv([['Ship date',o.ship],['Actual ship date',o.act||'-'],['Days early(+) / late(-)',o.days==null?'-':o.days],['Status',tag(o.st)],['Ship month',MON[o.mo]||'-']])}</table></div>
 <div class="c"><h3>Price &amp; value</h3><table>${kv([['Currency',o.cur],['FOB (per pack)',o.fob],['Total value',nf(o.val,2)]])}</table></div>
 <div class="c"><h3>Yarn summary</h3><table>${kv([['Consumption (kg/dz)',o.cons||'-'],['Total yarn (kg)',o.req?nf(o.req,1):'-'],['Breakdown',yy]])}</table></div></div>`}
 
 /* ---------- Yarn Booking ---------- */
 V.yb=()=>{const L=orders().filter(o=>(YB.yr==='All'||o.yr==YB.yr)&&(YB.dept==='All'||o.dept===YB.dept)),ys=S.set.yarns;
-const kg=(m,y)=>L.filter(o=>o.mo===m).reduce((s,o)=>s+[1,2,3,4].reduce((t,n)=>t+(o['y'+n]===y?o.yk[n-1]:0),0),0);
+const kg=(m,y)=>L.filter(o=>o.mo===m).reduce((s,o)=>s+YN.reduce((t,n)=>t+(o['y'+n]===y?o.yk[n-1]:0),0),0);
 const rows=MON.map((mn,m)=>{const v=ys.map(y=>kg(m,y));return `<tr><td>${mn}</td>${v.map(x=>`<td class="n">${x?nf(x):'-'}</td>`).join('')}<td class="n"><b>${nf(v.reduce((a,b)=>a+b,0))}</b></td></tr>`});
 const tv=ys.map(y=>MON.reduce((s,_,m)=>s+kg(m,y),0));rows.push(`<tr class="tot"><td>Total</td>${tv.map(x=>`<td class="n">${nf(x)}</td>`).join('')}<td class="n">${nf(tv.reduce((a,b)=>a+b,0))}</td></tr>`);
 $('#main').innerHTML=`<div class="bar"><label>Year${sel('yy',yrs(),YB.yr,"YB.yr=this.value;V.yb()")}</label><label>Dept${sel('yd',['All',...S.set.depts],YB.dept,"YB.dept=this.value;V.yb()")}</label></div><p class="note">Monthly yarn booking (kg) = (Consumption / 12 x Total pcs) / yield x Yarn %, month = ship month</p><div class="c">${tbl(['Month',...ys.map(esc),'Total kg'],rows,ys.map((_,i)=>i+1).concat([ys.length+1]))}</div>`};
 
 /* ---------- Yarn Purchase (new) ---------- */
-function usedList(){const A=asof(),out=[];orders().forEach(o=>{if(!o.req)return;const d=YP.basis==='act'?o.act:o.ship;if(!d||(YP.basis==='asof'&&d>A))return;[1,2,3,4].forEach(n=>{if(o['y'+n]&&o.yk[n-1])out.push({d,y:o['y'+n],kg:o.yk[n-1]})})});return out}
+function usedList(){const A=asof(),out=[];orders().forEach(o=>{if(!o.req)return;const d=YP.basis==='act'?o.act:o.ship;if(!d||(YP.basis==='asof'&&d>A))return;YN.forEach(n=>{if(o['y'+n]&&o.yk[n-1])out.push({d,y:o['y'+n],kg:o.yk[n-1]})})});return out}
 const inR=d=>(!YP.from||d>=YP.from)&&(!YP.to||d<=YP.to);
 function ypData(){const P=S.pur.filter(p=>inR(p.d)&&(YP.y==='All'||p.y===YP.y)),U=usedList().filter(u=>inR(u.d)&&(YP.y==='All'||u.y===YP.y));
 const ys=[...new Set([...S.set.yarns,...P.map(p=>p.y),...U.map(u=>u.y)])].filter(y=>YP.y==='All'||y===YP.y);
@@ -166,24 +216,117 @@ const mo={};P.forEach(p=>{const k=p.d.slice(0,7);(mo[k]=mo[k]||{p:0,u:0}).p+=+p.
 V.yp=()=>{const{P,sm,mo}=ypData(),tp=sm.reduce((s,r)=>s+r.p,0),tu=sm.reduce((s,r)=>s+r.u,0),bc=v=>`<span class="${v<0?'neg':'pos'}">${nf(v)}</span>`;
 let run=0;const led=Object.keys(mo).sort().map(k=>{run+=mo[k].p-mo[k].u;return `<tr><td>${k}</td><td class="n">${nf(mo[k].p)}</td><td class="n">${nf(mo[k].u)}</td><td class="n">${bc(mo[k].p-mo[k].u)}</td><td class="n">${bc(run)}</td></tr>`});
 const log=[...P].sort((a,b)=>b.d.localeCompare(a.d)).map(p=>`<tr><td>${p.d}</td><td>${esc(p.y)}</td><td>${esc(p.sup)}</td><td>${esc(p.ref)}</td><td class="n">${nf(p.qty,1)}</td><td>${isAdmin?`<button class="g" id="p${p.id}" onclick="delP('${p.id}')">Delete</button>`:''}</td></tr>`);
-$('#main').innerHTML=`${isAdmin?`<div class="c" style="margin-bottom:12px"><h3>Add yarn purchase</h3><div class="form"><label>Date<input id="pd" type="date" value="${today()}"></label><label>Yarn count${sel('py',S.set.yarns,S.set.yarns[0],'')}</label><label>Supplier<input id="ps"></label><label>Invoice / ref<input id="pr2"></label><label>Qty (kg)<input id="pk" type="number" step="any"></label></div><p class="msg" id="pm"></p><button class="b" onclick="addP()">Add purchase</button></div>`:''}
+$('#main').innerHTML=`${msgBox()}${isAdmin?`<div class="c" style="margin-bottom:12px"><h3>Add yarn purchase</h3><div class="form"><label>Date<input id="pd" type="date" value="${today()}"></label><label>Yarn count${sel('py',S.set.yarns,S.set.yarns[0],'')}</label><label>Supplier<input id="ps"></label><label>Invoice / ref<input id="pr2"></label><label>Qty (kg)<input id="pk" type="number" step="any"></label></div><p class="msg" id="pm"></p><button class="b" onclick="addP()">Add purchase</button> <button class="g" onclick="$('#xp').click()">&#8679; Upload Excel</button><input id="xp" type="file" accept=".xlsx,.xls,.csv" hidden onchange="impPur(this)"> <button class="g" onclick="tplPur()">Excel template</button></div>`:''}
 <div class="bar"><label>From<input type="date" value="${YP.from}" onchange="YP.from=this.value;V.yp()"></label><label>To<input type="date" value="${YP.to}" onchange="YP.to=this.value;V.yp()"></label><label>Yarn count${sel('yf',['All',...S.set.yarns],YP.y,"YP.y=this.value;V.yp()")}</label><label>Used yarn basis<select onchange="YP.basis=this.value;V.yp()"><option value="act"${YP.basis==='act'?' selected':''}>Shipped orders (actual ship date)</option><option value="asof"${YP.basis==='asof'?' selected':''}>Ship date up to as-of date</option><option value="all"${YP.basis==='all'?' selected':''}>All booked orders (ship date)</option></select></label><button class="g" onclick="expP()">Export CSV</button></div>
 <div class="kpis"><div class="k"><small>Total purchased (kg)</small><b>${nf(tp)}</b></div><div class="k"><small>Used yarn (kg)</small><b>${nf(tu)}</b></div><div class="k"><small>Balance yarn (kg)</small><b>${bc(tp-tu)}</b><span>${tp-tu<0?'Short: used more than purchased':'Purchased - used'}</span></div></div>
 <div class="c" style="margin-bottom:12px"><h3>Yarn purchase report by count</h3>${tbl(['Yarn count','Purchased kg','Used kg','Balance kg','Used %'],sm.map(r=>`<tr><td>${esc(r.y)}</td><td class="n">${nf(r.p)}</td><td class="n">${nf(r.u)}</td><td class="n">${bc(r.b)}</td><td class="n">${r.p?Math.round(r.u/r.p*100)+'%':'-'}</td></tr>`).concat([`<tr class="tot"><td>Total</td><td class="n">${nf(tp)}</td><td class="n">${nf(tu)}</td><td class="n">${bc(tp-tu)}</td><td class="n">${tp?Math.round(tu/tp*100)+'%':'-'}</td></tr>`]),[1,2,3,4])}</div>
 <div class="grid"><div class="c"><h3>Monthly ledger (running balance)</h3>${tbl(['Month','Purchased','Used','Net','Balance'],led,[1,2,3,4])}</div><div class="c"><h3>Purchase log</h3>${tbl(['Date','Yarn count','Supplier','Ref','Qty kg',''],log,[4])}</div></div>
 <p class="note">Used yarn comes from Data Entry: (Consumption / 12 x Total pcs) / yield x Yarn %. Balance = purchased - used within the selected dates.</p>`};
 function addP(){const q=+$('#pk').value,d=$('#pd').value;if(!d||!(q>0)){$('#pm').innerHTML='<span class="neg">Enter a date and a quantity</span>';return}
-S.pur.push({id:'p'+Date.now(),d,y:$('#py').value,sup:$('#ps').value.trim(),ref:$('#pr2').value.trim(),qty:q});save();V.yp()}
-function delP(id){const b=$('#p'+id);if(b.dataset.a!=='1'){b.dataset.a='1';b.textContent='Sure?';return}S.pur=S.pur.filter(p=>p.id!==id);save();V.yp()}
+S.pur.push({id:'p'+Date.now(),d,y:$('#py').value,sup:$('#ps').value.trim(),ref:$('#pr2').value.trim(),qty:q});save('pur');V.yp()}
+function delP(id){const b=$('#p'+id);if(b.dataset.a!=='1'){b.dataset.a='1';b.textContent='Sure?';return}S.pur=S.pur.filter(p=>p.id!==id);save('pur');V.yp()}
 async function expP(){const{sm}=ypData(),c=['Yarn count,Purchased kg,Used kg,Balance kg',...sm.map(r=>`"${r.y}",${r.p.toFixed(1)},${r.u.toFixed(1)},${r.b.toFixed(1)}`),'','Date,Yarn count,Supplier,Ref,Qty kg',...S.pur.map(p=>`${p.d},"${p.y}","${p.sup}","${p.ref}",${p.qty}`)].join('\n');const blob=new Blob([c],{type:'text/csv;charset=utf-8;'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='yarn_purchase_report.csv';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}
 
 /* ---------- Settings ---------- */
 V.set=()=>{const s=S.set;$('#main').innerHTML=`<div class="c"><h3>Assumptions</h3><div class="form"><label>EUR to USD rate<input id="s1" type="number" step="any" value="${s.eur}"></label><label>Yarn yield factor<input id="s2" type="number" step="any" value="${s.yld}"></label><label>On-time threshold (days)<input id="s3" type="number" value="${s.thr}"></label><label>As-of date (blank = today)<input id="s4" type="date" value="${s.asof}"></label></div>
 <div class="form" style="margin-top:10px"><label>Yarn count list (one per line)<textarea id="s5" rows="10">${esc(s.yarns.join('\n'))}</textarea></label><label>Dept list (one per line)<textarea id="s6" rows="6">${esc(s.depts.join('\n'))}</textarea></label></div>
-<p class="note">EUR rate is a placeholder, enter your current rate. Yarn kg = (Consumption / 12 x Total pcs) / yield x %. Late if (Ship date - Actual ship date) is less than the threshold. PO numbers must be unique.</p><button class="b" onclick="subS()">Save settings</button> <span id="sm" class="pos"></span></div>`};
-function subS(){const l=id=>$(id).value.split('\n').map(x=>x.trim()).filter(Boolean);Object.assign(S.set,{eur:+$('#s1').value||1,yld:+$('#s2').value||.88,thr:+$('#s3').value,asof:$('#s4').value,yarns:l('#s5'),depts:l('#s6')});save();$('#sm').textContent='Saved'}
+<p class="note">EUR rate is a placeholder, enter your current rate. Yarn kg = (Consumption / 12 x Total pcs) / yield x %. Late if (Ship date - Actual ship date) is less than the threshold. PO numbers must be unique.</p><button class="b" onclick="subS()">Save settings</button> <span id="sm" class="pos"></span></div>${storageCard()}`};
+function subS(){const l=id=>$(id).value.split('\n').map(x=>x.trim()).filter(Boolean);Object.assign(S.set,{eur:+$('#s1').value||1,yld:+$('#s2').value||.88,thr:+$('#s3').value,asof:$('#s4').value,yarns:l('#s5'),depts:l('#s6')});save('set');$('#sm').textContent='Saved'}
 
-try{adopt(localStorage.getItem('osd')||'{}')}catch(e){}
-(async()=>{try{DB=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);const{data,error}=await DB.auth.getSession();if(error)throw error;if(data.session){await startApp(data.session)}else{loginView()}DB.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_IN'&&session&&!currentUser){setTimeout(()=>startApp(session),0)}else if(event==='SIGNED_OUT'){currentUser=null;isAdmin=false;remoteReady=false;loginView('')}});setInterval(async()=>{if(!currentUser||!remoteReady||remoteBusy)return;try{const{data,error}=await DB.from('dashboard_state').select('updated_at').eq('id','main').maybeSingle();if(!error&&data&&data.updated_at&&data.updated_at!==lastUpdated){await loadSharedData()}}catch(e){}},10000)}catch(e){loginView(e.message)}})();
+
+/* ---------- Excel import / templates ---------- */
+const nh=h=>String(h).toLowerCase().replace(/%/g,'pct').replace(/[^a-z0-9]/g,'');
+const OA={style:['style','styleno','stylenumber','stylenum','stylename'],desc:['description','desc','itemdescription','item'],dept:['dept','department'],po:['po','pono','ponumber','ponum'],pack:['packqty','packquantity','packs','pack','noofpack'],pcs:['pcspack','pcsperpack','pcsinpack','piecesperpack'],opd:['orderplacementdate','placementdate','orderplaced','orderdate','placedate','opd','orderplacedate'],ship:['shipdate','shipmentdate','deliverydate','plannedshipdate'],act:['actualshipdate','actualship','actshipdate','actualshipmentdate','actualdeliverydate'],cur:['currency','cur'],fob:['fob','fobperpack','fobprice','fobpackprice'],cons:['consumption','consumptionkgdz','consumptionkgperdz','consumptionkgdozen','cons','consumptionperdz']};
+YN.forEach(n=>{OA['y'+n]=['yarn'+n,'yarncount'+n,'y'+n,'count'+n];OA['p'+n]=['yarn'+n+'pct','yarn'+n+'share','yarn'+n+'sharepct','yarn'+n+'percent','yarn'+n+'percentage','yarncount'+n+'pct','yarncount'+n+'share','share'+n,'sharepct'+n,'pct'+n,'p'+n,'percent'+n]});
+const PA={d:['date','purchasedate','invoicedate','receivedate'],y:['yarncount','yarn','count','yarnname'],sup:['supplier','suppliername','party','vendor'],ref:['invoiceref','invoice','ref','invoiceno','refno','reference','lcno'],qty:['qtykg','qty','quantity','quantitykg','kg','weightkg','weight']};
+function mapH(keys,A){const m={},nk=keys.map(k=>[k,nh(k)]);for(const f in A){const hit=nk.find(([k,n])=>A[f].includes(n));if(hit)m[f]=hit[0]}return m}
+function readXlsx(file){return new Promise((res,rej)=>{if(!window.XLSX)return rej(new Error('Excel library load hoyni (internet check korun)'));const fr=new FileReader();
+ fr.onload=()=>{try{const wb=XLSX.read(new Uint8Array(fr.result),{type:'array'});res(wb.SheetNames.map(n=>XLSX.utils.sheet_to_json(wb.Sheets[n],{defval:'',raw:true})))}catch(e){rej(e)}};
+ fr.onerror=()=>rej(fr.error);fr.readAsArrayBuffer(file)})}
+function canonList(list,v){const t=String(v==null?'':v).trim();if(!t)return '';const f=list.find(x=>x.toLowerCase()===t.toLowerCase());if(f)return f;list.push(t);return t}
+const msgBox=()=>IMSG?`<div class="c" style="margin-bottom:12px">${IMSG}<p style="margin:8px 0 0"><button class="g" onclick="IMSG='';show(tab)">Close</button></p></div>`:'';
+function banner(){if(!isAdmin||!remoteReady||S.orders.length||S.pur.length||tab==='set')return;
+ $('#main').insertAdjacentHTML('afterbegin',`<div class="c" style="margin-bottom:12px"><b>Google Sheet-e ekhono kono data nai.</b> Ei website-e age save kora purano data Google Sheet-e ante <button class="b" onclick="migrate()">Purano data Google Sheet-e nin</button> chap din. Othoba Data Entry theke Excel upload korun.</div>`)}
+function dl(rows,name,sheet){const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(rows),sheet);XLSX.writeFile(wb,name)}
+function tplOrders(){const h=['Style No','Description','Dept','PO','Pack Qty','Pcs per Pack','Order Placement Date','Ship Date','Actual Ship Date','Currency','FOB per Pack','Consumption kg/dz',...YN.flatMap(n=>['Yarn '+n,'Yarn '+n+' %'])];
+ dl([h,['22013782','SAMPLE TEE','MAIN','PO12345',2000,3,'2026-01-05','2026-02-21','','USD',6.9,2.7,'28/s Cotton',100,...Array(10).fill('')]],'orders_template.xlsx','Orders')}
+function tplPur(){dl([['Date','Yarn Count','Supplier','Invoice / Ref','Qty (kg)'],['2026-01-10','28/s Cotton','ABC Spinning','INV-001',1500]],'yarn_purchase_template.xlsx','YarnPurchase')}
+async function impOrders(inp){const f=inp.files[0];inp.value='';if(!f)return;
+ try{const sheets=await readXlsx(f);let rows=null,m=null;
+  for(const s of sheets){if(!s.length)continue;const mm=mapH(Object.keys(s[0]),OA);if(mm.po){rows=s;m=mm;break}}
+  if(!rows){IMSG='<span class="neg">PO column pawa jayni. "Excel template" download kore oi header-e upload korun.</span>';V.data();return}
+  const rep={add:0,upd:0,fill:0,err:[]},y0=S.set.yarns.length,d0=S.set.depts.length;
+  rows.forEach((r,i)=>{const line=i+2,get=k=>m[k]===undefined?'':r[m[k]],bad=t=>rep.err.push('Row '+line+': '+t);
+   if(Object.values(r).every(v=>String(v).trim()===''))return;
+   const po=String(get('po')).trim();if(!po){bad('PO nai');return}
+   let ok=true;const o={po,style:String(get('style')).trim(),desc:String(get('desc')).trim(),dept:canonList(S.set.depts,get('dept')),cur:String(get('cur')).trim().toUpperCase()};
+   ['opd','ship','act'].forEach(k=>{const v=get(k),d=pd(v);if(String(v).trim()!==''&&d===null){bad(k+' date bujha jayni ('+v+')');ok=false}o[k]=d||''});
+   ['pack','pcs','fob','cons'].forEach(k=>{const v=num(get(k));if(v!==v){bad(k+' number noy');ok=false}o[k]=v});
+   if(o.cur&&!['USD','EUR'].includes(o.cur)){bad('Currency USD/EUR hobe');ok=false}
+   const ps={};YN.forEach(n=>{o['y'+n]=canonList(S.set.yarns,get('y'+n));const p=num(get('p'+n));if(p!==p){bad('Yarn '+n+' % number noy');ok=false}ps[n]=p});
+   const has=YN.filter(n=>o['y'+n]),given=has.filter(n=>ps[n]!=='');
+   YN.forEach(n=>o['p'+n]='');
+   if(has.length&&given.length){const sum=given.reduce((s,n)=>s+ps[n],0),k=sum>1.5?0.01:1;has.forEach(n=>{o['p'+n]=ps[n]===''?'':+(ps[n]*k).toFixed(6)})}
+   else if(has.length===1)o['p'+has[0]]=1;
+   if(!ok)return;
+   const ex=S.orders.find(x=>x.po===po);let T;
+   if(ex){T=Object.assign({},ex);['style','desc','dept','cur','opd','ship','act','pack','pcs','fob','cons'].forEach(k=>{if(o[k]!==''&&o[k]!=null)T[k]=o[k]});if(has.length)YN.forEach(n=>{T['y'+n]=o['y'+n];T['p'+n]=o['p'+n]})}
+   else{T=Object.assign({},o,{id:'n'+Date.now().toString(36)+i});if(!T.cur)T.cur='USD';if(!T.dept)T.dept=S.set.depts[0]}
+   let filled=false;
+   if(T.style&&(!YN.some(n=>T['y'+n])||T.cons===''||T.cons==null)){
+    const ref=[...S.orders].reverse().find(x=>x.id!==T.id&&String(x.style)===String(T.style)&&x.cons&&YN.some(n=>x['y'+n]));
+    if(ref){if(!YN.some(n=>T['y'+n])){YN.forEach(n=>{T['y'+n]=ref['y'+n]||'';T['p'+n]=ref['p'+n]||''});filled=true}
+     if(T.cons===''||T.cons==null){T.cons=ref.cons;filled=true}
+     if(!T.desc)T.desc=ref.desc}}
+   const t=YN.reduce((s,n)=>s+(+T['p'+n]||0),0);
+   if(T.cons&&Math.abs(t-1)>1e-4){bad('Yarn % total 100 noy ('+(+(t*100).toFixed(2))+')');return}
+   if(!T.ship){bad('Ship date nai');return}
+   if(filled)rep.fill++;
+   if(ex){S.orders=S.orders.map(x=>x.id===ex.id?T:x);rep.upd++}else{S.orders.push(T);rep.add++}});
+  if(rep.add||rep.upd){save('orders');if(S.set.yarns.length!==y0||S.set.depts.length!==d0)save('set')}
+  IMSG=`<b>Excel import: ${rep.add} notun order, ${rep.upd} update, ${rep.fill} order-e style mile yarn auto-calculation hoyeche.</b>`
+   +(rep.err.length?`<br><span class="neg">${rep.err.length} row skip hoyeche:</span><br>${rep.err.slice(0,15).map(esc).join('<br>')}${rep.err.length>15?'<br>...':''}`:'')
+   +(S.set.yarns.length>y0?'<br>Notun yarn count Settings list-e add hoyeche.':'')+(S.set.depts.length>d0?'<br>Notun dept Settings list-e add hoyeche.':'');
+  V.data()}catch(e){IMSG='<span class="neg">Import failed: '+esc(e.message)+'</span>';V.data()}}
+async function impPur(inp){const f=inp.files[0];inp.value='';if(!f)return;
+ try{const sheets=await readXlsx(f);let rows=null,m=null;
+  for(const s of sheets){if(!s.length)continue;const mm=mapH(Object.keys(s[0]),PA);if(mm.qty&&mm.y){rows=s;m=mm;break}}
+  if(!rows){IMSG='<span class="neg">Date / Yarn Count / Qty column pawa jayni. "Excel template" download kore oi header-e upload korun.</span>';V.yp();return}
+  const rep={add:0,dup:0,err:[]},y0=S.set.yarns.length;
+  rows.forEach((r,i)=>{const line=i+2,get=k=>m[k]===undefined?'':r[m[k]],bad=t=>rep.err.push('Row '+line+': '+t);
+   if(Object.values(r).every(v=>String(v).trim()===''))return;
+   const d=pd(get('d')),q=num(get('qty')),y=canonList(S.set.yarns,get('y'));
+   if(!d){bad('Date nai/bujha jayni');return}if(!y){bad('Yarn count nai');return}if(!(q>0)){bad('Qty positive number hobe');return}
+   const p={id:'p'+Date.now().toString(36)+i,d,y,sup:String(get('sup')).trim(),ref:String(get('ref')).trim(),qty:q};
+   if(S.pur.some(x=>x.d===p.d&&x.y===p.y&&x.sup===p.sup&&String(x.ref)===p.ref&&+x.qty===p.qty)){rep.dup++;return}
+   S.pur.push(p);rep.add++});
+  if(rep.add){save('pur');if(S.set.yarns.length!==y0)save('set')}
+  IMSG=`<b>Yarn purchase import: ${rep.add} row add hoyeche${rep.dup?', '+rep.dup+' ta age theke chhilo (skip)':''}.</b>`
+   +(rep.err.length?`<br><span class="neg">${rep.err.length} row skip hoyeche:</span><br>${rep.err.slice(0,15).map(esc).join('<br>')}${rep.err.length>15?'<br>...':''}`:'')
+   +(S.set.yarns.length>y0?'<br>Notun yarn count Settings list-e add hoyeche.':'');
+  V.yp()}catch(e){IMSG='<span class="neg">Import failed: '+esc(e.message)+'</span>';V.yp()}}
+
+/* ---------- Style match -> auto yarn calculation (entry form) ---------- */
+function setSel(el,val){if(val&&![...el.options].some(o=>o.value===val))el.add(new Option(val,val));el.value=val||''}
+function autoStyle(force){const st=$('#f_style').value.trim(),m=$('#stmsg');if(!st){m.textContent='';return}
+ const ref=[...S.orders].reverse().find(x=>String(x.style)===st&&x.id!==EF.id&&x.cons&&YN.some(n=>x['y'+n]));
+ if(!ref){m.textContent='';return}
+ const empty=!$('#f_cons').value&&YN.every(n=>!$('#f_y'+n).value);
+ if(empty||force===true){$('#f_cons').value=ref.cons;YN.forEach(n=>{setSel($('#f_y'+n),ref['y'+n]||'');$('#f_p'+n).value=ref['p'+n]?+(ref['p'+n]*100).toFixed(2):''});
+  if(!$('#f_desc').value)$('#f_desc').value=ref.desc||'';
+  m.innerHTML=`<span class="pos">&#10003; Style mile geche (PO ${esc(ref.po)}): consumption o yarn auto-fill hoyeche, yarn calculation niche dekhaccche.</span>`;calcP()}
+ else m.innerHTML=`Style mile geche (PO ${esc(ref.po)}) &mdash; <button class="g" onclick="autoStyle(true)">Oi style-er yarn data bosan</button>`}
+
+/* ---------- Migration from the old storage ---------- */
+async function migrate(){if(!isAdmin)return;
+ if((S.orders.length||S.pur.length)&&!confirm('Google Sheet-e age theke data ache. Purano data diye overwrite korben?'))return;
+ try{const{data,error}=await DB.from('dashboard_state').select('data').eq('id','main').maybeSingle();if(error)throw error;
+  const old=(data&&data.data)||{},ov=old.ov||{},Lst=[];
+  BASE.forEach((a,i)=>{const id='b'+i;if(ov[id]===null)return;Lst.push(ov[id]||Object.assign({id},zip(a)))});(old.added||[]).forEach(o=>Lst.push(o));
+  S.orders=Lst.map(o=>Object.assign({opd:'',y5:'',p5:'',y6:'',p6:''},o));S.pur=old.pur||[];if(old.set)S.set=Object.assign({},S.set,old.set);
+  save('orders','pur','set');alert(S.orders.length+' order ar '+S.pur.length+' yarn purchase Google Sheet-e pathano hocche.');show(tab)}
+ catch(e){alert('Migrate hoyni: '+e.message)}}
+function storageCard(){return `<div class="c" style="margin-top:12px"><h3>Data storage</h3><p class="note">Sob data (orders, yarn purchase, settings) shudhu Google Sheet-er 3-ta tab-e save hoy: <b>Dashboard_Orders</b>, <b>Dashboard_YarnPurchase</b>, <b>Dashboard_Settings</b>. Onno kothao save hoy na.</p><div class="row"><button class="g" onclick="reloadSheet()">Reload from Google Sheet</button><button class="g" onclick="migrate()">Purano data &rarr; Google Sheet</button></div></div>`}
+
+(async()=>{try{DB=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);const{data,error}=await DB.auth.getSession();if(error)throw error;if(data.session){await startApp(data.session)}else{loginView()}DB.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_IN'&&session&&!currentUser){setTimeout(()=>startApp(session),0)}else if(event==='SIGNED_OUT'){currentUser=null;isAdmin=false;remoteReady=false;loginView('')}});setInterval(pollSheet,45000)}catch(e){loginView(e.message)}})();
 </script></body></html>
-
